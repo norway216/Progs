@@ -23,6 +23,11 @@ enum class EType : int {
     M = 4
 };
 
+// 结构体
+struct Point {
+    double x, y, z;
+};
+
 // 测试函数
 void func1 (const std::string& str) {
     fmt::print("string: {0}\n", str);
@@ -40,11 +45,27 @@ void func1 (const std::string& str) {
     fmt::print("EType: {0}\n", static_cast<int>(etype));
 }
 
+void func_struct (const Point& p) {
+    fmt::print("Point: {0}, {1}, {2}\n", p.x, p.y, p.z);
+}
+
+void func_struct1 (const Point* p) {
+    if (p == nullptr) {
+        fmt::print("参数错误...\n");
+        return;
+    }
+    fmt::print("Point: {0}, {1}, {2}\n", p->x, p->y, p->z);
+}
+
 int main () {
 
     std::string str{"Google"};
 
     func1(str);
+
+    Point p {12, 15, 17.9};
+    func_struct(p);
+    func_struct1(&p);
 
     return 0;
 }
