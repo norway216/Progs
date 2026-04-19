@@ -32,9 +32,39 @@ void func1 (bool flag) {
     }
 }
 
+// 2. 结构体和指针
+struct Point {
+    double x, y, z;
+};
+
+void func2 (Point* p) {
+    if (p == nullptr) {
+        return;
+    }
+    *p = {10, 12, 14};
+    fmt::print("Point: x {0}, y {1}, z {2}\n", p->x, p->y, p->z);
+    fmt::print("address: {0}\n", fmt::ptr(p));
+}
+// 3. 函数和指针
+typedef void(*func_ptr)(Point* );
+void f (Point* p) {
+    fmt::print("Point: ( {0}, {1}, {2})\n", p->x, p->y, p->z);
+}
+void func3 () {
+    // 测试函数和函数指针
+    func_ptr fp = f;
+    Point p{1, 2, 3};
+    fp(&p);
+}
+
 int main () {
     bool flag = true;
     func1(flag);
+
+    Point p;
+    func2(&p);
+
+    func3();
 
     return 0;
 }
