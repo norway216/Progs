@@ -57,6 +57,26 @@ void func3 () {
     fp(&p);
 }
 
+// 4. 类和指针
+template <typename T>
+class Point1D {
+public:
+    Point1D (const T& x)
+        : m_x {x} {
+
+    }
+public:
+    virtual void print () {
+        fmt::print("Point1D<T>::print -> {0}\n", m_x);
+    }
+protected:
+    T m_x;
+};
+
+void f_c (Point1D<int>* pc) {
+    pc->print();
+}
+
 int main () {
     bool flag = true;
     func1(flag);
@@ -65,6 +85,9 @@ int main () {
     func2(&p);
 
     func3();
+
+    Point1D<int> pc1 {5};
+    f_c (&pc1);
 
     return 0;
 }
