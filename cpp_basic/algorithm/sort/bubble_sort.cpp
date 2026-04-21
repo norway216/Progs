@@ -1,9 +1,10 @@
 #include <iostream>
 #include <vector>
-#include <utility>  // std::swap
+#include <functional>
+#include <utility>
 
-template<typename T>
-void bubbleSortOptimized(std::vector<T>& arr) {
+template<typename T, typename Compare = std::less<T>>
+void bubbleSortHighPerf(std::vector<T>& arr, Compare comp = Compare{}) {
     if (arr.size() < 2) {
         return;
     }
@@ -14,7 +15,7 @@ void bubbleSortOptimized(std::vector<T>& arr) {
         std::size_t lastSwap = 0;
 
         for (std::size_t i = 1; i < n; ++i) {
-            if (arr[i - 1] > arr[i]) {
+            if (comp(arr[i], arr[i - 1])) {
                 std::swap(arr[i - 1], arr[i]);
                 lastSwap = i;
             }
@@ -29,14 +30,21 @@ void bubbleSortOptimized(std::vector<T>& arr) {
 }
 
 int main() {
-    std::vector<int> nums = {5, 1, 4, 2, 8, 3, 6};
+    std::vector<int> nums = {5, 2, 9, 1, 3};
 
-    bubbleSortOptimized(nums);
+    bubbleSortHighPerf(nums); // 升序
 
-    for (const auto& x : nums) {
+    for (auto x : nums) {
         std::cout << x << " ";
     }
-    std::cout << std::endl;
+    std::cout << '\n';
+
+    bubbleSortHighPerf(nums, std::greater<int>{}); // 降序
+
+    for (auto x : nums) {
+        std::cout << x << " ";
+    }
+    std::cout << '\n';
 
     return 0;
 }
