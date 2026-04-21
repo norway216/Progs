@@ -52,5 +52,10 @@ int main () {
     char* buffer = nullptr;
     f1 (buffer, 1024);
 
+    if (buffer != nullptr) {
+        delete[] buffer;
+        buffer = nullptr;
+    }
+
     return 0;
 }
