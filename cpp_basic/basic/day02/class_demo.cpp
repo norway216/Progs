@@ -37,12 +37,32 @@ void f2 (int*&& p) {
     fmt::print("address of p: {0}, value is: {1}\n", fmt::ptr(p), *p);
 }
 
+// 指针的引用：
+// 1. 指针的左值引用，指的是指针变量的引用；
+// 2. 另外一种是指针的右值引用，可以是某个变量的地址的直接引用
+void f3 (int*& p) {
+    fmt::print("address: {0}, value: {1}\n", fmt::ptr(p), *p);
+    int* b = new int(3);
+    p = b;
+    fmt::print("address: {0}, value: {1}\n", fmt::ptr(p), *p);
+    *p = 999;
+    fmt::print("address: {0}, value: {1}\n", fmt::ptr(p), *p);
+}
+
+// const引用，可以接收右值类型  const修饰的是&引用
+void f4 ( int* const & p) {
+    fmt::print("address: {0}, value: {1}\n", fmt::ptr(p), *p);
+}
+
 int main () {
     int arr[] = {3, 6, 7, 2, 9};
     f (arr, sizeof(arr)/sizeof(arr[0]));
     f1 (arr, sizeof(arr)/sizeof(arr[0]));
     int a = 8;
     f2 (&a);
+    int* p = &a;
+    f3 (p);
+    f4(&a);
 
     return 0;
 }
