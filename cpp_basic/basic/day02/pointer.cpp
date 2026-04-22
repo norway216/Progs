@@ -31,6 +31,16 @@ void f5 (int* && p) {
     fmt::print("address: {0}, value: {1}\n", fmt::ptr(p), *p);
 }
 
+// 6. 指针和数组：其实数组就是一段连续的内存空间，char是单字节，int就可以看成是char的数组，
+// 可以这么理解，内存就是一块大树组
+void f6 (int* arr, int len) {
+    int sum = 0;
+    for (int i = 0; i < len; ++i) {
+        sum += arr[i];
+    }
+    fmt::print("sum: {0}\n", sum);
+}
+
 
 int main () {
     int a = 9;
@@ -40,6 +50,9 @@ int main () {
     f3 (p);
     f4 (p);
     f5 (&a);
+
+    int arr[] = {1, 2, 3,4 ,5};
+    f6 (arr, 5);
 
     return 0;
 }
