@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/qml">
+        <file alias="main.qml">../qml/main.qml</file>
+        <file alias="components/StatusBadge.qml">../qml/components/StatusBadge.qml</file>
+        <file alias="components/ControlButton.qml">../qml/components/ControlButton.qml</file>
+        <file alias="components/ParameterSlider.qml">../qml/components/ParameterSlider.qml</file>
+        <file alias="components/ImageViewport.qml">../qml/components/ImageViewport.qml</file>
+        <file alias="components/ModePanel.qml">../qml/components/ModePanel.qml</file>
+        <file alias="components/CineBar.qml">../qml/components/CineBar.qml</file>
+        <file alias="components/PatientDialog.qml">../qml/components/PatientDialog.qml</file>
+    </qresource>
+</RCC>
