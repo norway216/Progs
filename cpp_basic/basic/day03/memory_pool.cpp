@@ -1,87 +1,97 @@
 #include <iostream>
+#include <unordered_map>
 #include <vector>
-#include <array>
 #include <mutex>
 #include <thread>
 #include <chrono>
 #include <atomic>
-#include <cassert>
-#include <new>
 #include <cstring>
 #include <cstdlib>
+#include <cassert>
 
-#ifdef _WIN32
-    #include <windows.h>
-#else
-    #include <sys/mman.h>
-    #include <unistd.h>
-#endif
+#include <sys/mman.h>
+#include <unistd.h>
 
 // ============================================================
-// 高性能内存池：单文件版本
-// 特点：
-// 1. 支持小对象快速分配
-// 2. 使用 size class 分级管理
-// 3. 使用 thread_local 线程本地缓存减少锁竞争
-// 4. 大块内存直接走系统 malloc/free
-// 5. 支持 create<T>() / destroy<T>()
-// 6. 支持 STL allocator
+// Linux 高性能内存池
+//
+// 设计目标：
+// 1. 只支持 Linux
+// 2. 使用 mmap 向系统申请内存页
+// 3. 支持不同大小的内存页
+// 4. 按申请大小进行分桶
+// 5. 申请内存时优先查找相同 size 的空闲块
+// 6. 如果没有相同 size 的空闲块，则向系统申请新页
+// 7. 用户释放内存后，不还给系统，而是放回内存池
+// 8. 用户释放时不需要传 size
+// 9. 支持 create<T>() / destroy<T>()
+//
+// 适用场景：
+// - 超声图像帧 buffer
+// - 高频小块内存申请
+// - 图像算法临时缓存
+// - 网络包缓存
+// - 消息队列节点缓存
 // ============================================================
 
-class MemoryPool
+class LinuxMemoryPool
 {
-public:
-    static constexpr std::size_t ALIGNMENT = 8;
-    static constexpr std::size_t MAX_SMALL_SIZE = 1024;
-    static constexpr std::size_t NUM_SIZE_CLASSES = MAX_SMALL_SIZE / ALIGNMENT;
-    static constexpr std::size_t PAGE_SIZE = 64 * 1024;
-    static constexpr std::size_t LOCAL_CACHE_LIMIT = 64;
+private:
+    static constexpr std::size_t ALIGNMENT = 16;
+    static constexpr std::uint64_t BLOCK_MAGIC = 0x20260508CAFEBABEULL;
 
 private:
+    struct BlockHeader
+    {
+        std::uint64_t magic;
+        std::size_t requestedSize;
+        std::size_t blockSize;
+    };
+
     struct FreeNode
     {
         FreeNode* next;
     };
 
-    struct CentralFreeList
+    struct PageInfo
     {
-        FreeNode* head = nullptr;
-        std::mutex mtx;
+        void* pageAddress;
+        std::size_t pageSize;
+        std::size_t blockSize;
+        std::size_t blockCount;
     };
 
-    struct ThreadLocalFreeList
+    struct Bucket
     {
-        FreeNode* head = nullptr;
-        std::size_t count = 0;
-    };
-
-    struct PageBlock
-    {
-        void* memory = nullptr;
-        std::size_t size = 0;
-        PageBlock* next = nullptr;
+        FreeNode* freeList = nullptr;
+        std::size_t freeCount = 0;
+        std::size_t totalCount = 0;
+        std::mutex mutex;
     };
 
 private:
-    std::array<CentralFreeList, NUM_SIZE_CLASSES> centralLists_;
+    std::unordered_map<std::size_t, Bucket*> buckets_;
+    std::vector<PageInfo> pages_;
+
+    std::mutex bucketMapMutex_;
     std::mutex pageMutex_;
-    PageBlock* pageBlocks_ = nullptr;
 
 private:
-    MemoryPool() = default;
+    LinuxMemoryPool() = default;
 
-    ~MemoryPool()
+    ~LinuxMemoryPool()
     {
         releaseAllPages();
+        releaseAllBuckets();
     }
 
-    MemoryPool(const MemoryPool&) = delete;
-    MemoryPool& operator=(const MemoryPool&) = delete;
+    LinuxMemoryPool(const LinuxMemoryPool&) = delete;
+    LinuxMemoryPool& operator=(const LinuxMemoryPool&) = delete;
 
 public:
-    static MemoryPool& instance()
+    static LinuxMemoryPool& instance()
     {
-        static MemoryPool pool;
+        static LinuxMemoryPool pool;
         return pool;
     }
 
@@ -92,57 +102,74 @@ public:
             size = 1;
         }
 
-        if (size > MAX_SMALL_SIZE) {
-            return ::operator new(size);
+        const std::size_t blockSize = alignUp(size);
+        Bucket* bucket = getOrCreateBucket(blockSize);
+
+        {
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+
+            if (bucket->freeList != nullptr) {
+                FreeNode* node = bucket->freeList;
+                bucket->freeList = node->next;
+                bucket->freeCount--;
+
+                BlockHeader* header = getHeaderFromUserPointer(node);
+                assert(header->magic == BLOCK_MAGIC);
+                assert(header->blockSize == blockSize);
+
+                header->requestedSize = size;
+
+                return static_cast<void*>(node);
+            }
         }
 
-        const std::size_t index = sizeToIndex(size);
-        auto& localList = getThreadLocalList(index);
+        allocateNewPage(blockSize);
 
-        if (localList.head != nullptr) {
-            FreeNode* node = localList.head;
-            localList.head = node->next;
-            --localList.count;
-            return node;
-        }
+        {
+            std::lock_guard<std::mutex> lock(bucket->mutex);
 
-        refillLocalCache(index);
+            if (bucket->freeList != nullptr) {
+                FreeNode* node = bucket->freeList;
+                bucket->freeList = node->next;
+                bucket->freeCount--;
 
-        if (localList.head != nullptr) {
-            FreeNode* node = localList.head;
-            localList.head = node->next;
-            --localList.count;
-            return node;
+                BlockHeader* header = getHeaderFromUserPointer(node);
+                assert(header->magic == BLOCK_MAGIC);
+                assert(header->blockSize == blockSize);
+
+                header->requestedSize = size;
+
+                return static_cast<void*>(node);
+            }
         }
 
         throw std::bad_alloc();
     }
 
-    void deallocate(void* ptr, std::size_t size)
+    void deallocate(void* ptr)
     {
         if (ptr == nullptr) {
             return;
         }
 
-        if (size == 0) {
-            size = 1;
+        BlockHeader* header = getHeaderFromUserPointer(ptr);
+
+        if (header->magic != BLOCK_MAGIC) {
+            std::cerr << "[MemoryPool Error] Invalid pointer or memory corruption detected."
+                      << std::endl;
+            std::abort();
         }
 
-        if (size > MAX_SMALL_SIZE) {
-            ::operator delete(ptr);
-            return;
-        }
-
-        const std::size_t index = sizeToIndex(size);
-        auto& localList = getThreadLocalList(index);
+        const std::size_t blockSize = header->blockSize;
+        Bucket* bucket = getOrCreateBucket(blockSize);
 
         FreeNode* node = static_cast<FreeNode*>(ptr);
-        node->next = localList.head;
-        localList.head = node;
-        ++localList.count;
 
-        if (localList.count > LOCAL_CACHE_LIMIT) {
-            returnLocalCacheToCentral(index);
+        {
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            node->next = bucket->freeList;
+            bucket->freeList = node;
+            bucket->freeCount++;
         }
     }
 
@@ -154,7 +181,7 @@ public:
         try {
             return new (mem) T(std::forward<Args>(args)...);
         } catch (...) {
-            deallocate(mem, sizeof(T));
+            deallocate(mem);
             throw;
         }
     }
@@ -167,7 +194,40 @@ public:
         }
 
         obj->~T();
-        deallocate(obj, sizeof(T));
+        deallocate(obj);
+    }
+
+public:
+    void printStats()
+    {
+        std::lock_guard<std::mutex> mapLock(bucketMapMutex_);
+        std::lock_guard<std::mutex> pageLock(pageMutex_);
+
+        std::cout << "\n========== Memory Pool Stats ==========" << std::endl;
+
+        std::size_t totalPageBytes = 0;
+        for (const auto& page : pages_) {
+            totalPageBytes += page.pageSize;
+        }
+
+        std::cout << "Page count      : " << pages_.size() << std::endl;
+        std::cout << "Total page bytes: " << totalPageBytes << std::endl;
+        std::cout << "Bucket count    : " << buckets_.size() << std::endl;
+
+        for (const auto& kv : buckets_) {
+            std::size_t blockSize = kv.first;
+            Bucket* bucket = kv.second;
+
+            std::lock_guard<std::mutex> bucketLock(bucket->mutex);
+
+            std::cout << "BlockSize = " << blockSize
+                      << " bytes, total = " << bucket->totalCount
+                      << ", free = " << bucket->freeCount
+                      << ", used = " << bucket->totalCount - bucket->freeCount
+                      << std::endl;
+        }
+
+        std::cout << "=======================================\n" << std::endl;
     }
 
 private:
@@ -176,356 +236,185 @@ private:
         return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
 
-    static std::size_t sizeToIndex(std::size_t size)
+    static std::size_t alignUpToPage(std::size_t size)
     {
-        const std::size_t aligned = alignUp(size);
-        return aligned / ALIGNMENT - 1;
+        const std::size_t pageSize = static_cast<std::size_t>(::getpagesize());
+        return (size + pageSize - 1) & ~(pageSize - 1);
     }
 
-    static std::size_t indexToSize(std::size_t index)
+    static BlockHeader* getHeaderFromUserPointer(void* userPtr)
     {
-        return (index + 1) * ALIGNMENT;
+        return reinterpret_cast<BlockHeader*>(
+            static_cast<char*>(userPtr) - sizeof(BlockHeader)
+        );
     }
 
-private:
-    static ThreadLocalFreeList& getThreadLocalList(std::size_t index)
+    static void* getUserPointerFromHeader(BlockHeader* header)
     {
-        thread_local std::array<ThreadLocalFreeList, NUM_SIZE_CLASSES> localLists;
-        return localLists[index];
-    }
-
-private:
-    void refillLocalCache(std::size_t index)
-    {
-        constexpr std::size_t batchCount = 32;
-
-        auto& central = centralLists_[index];
-        auto& local = getThreadLocalList(index);
-
-        {
-            std::lock_guard<std::mutex> lock(central.mtx);
-
-            std::size_t count = 0;
-
-            while (central.head != nullptr && count < batchCount) {
-                FreeNode* node = central.head;
-                central.head = node->next;
-
-                node->next = local.head;
-                local.head = node;
-                ++local.count;
-                ++count;
-            }
-
-            if (count > 0) {
-                return;
-            }
-        }
-
-        allocateNewPage(index);
-
-        {
-            std::lock_guard<std::mutex> lock(central.mtx);
-
-            std::size_t count = 0;
-
-            while (central.head != nullptr && count < batchCount) {
-                FreeNode* node = central.head;
-                central.head = node->next;
-
-                node->next = local.head;
-                local.head = node;
-                ++local.count;
-                ++count;
-            }
-        }
-    }
-
-    void returnLocalCacheToCentral(std::size_t index)
-    {
-        constexpr std::size_t returnCount = 32;
-
-        auto& local = getThreadLocalList(index);
-        auto& central = centralLists_[index];
-
-        std::lock_guard<std::mutex> lock(central.mtx);
-
-        std::size_t count = 0;
-
-        while (local.head != nullptr && count < returnCount) {
-            FreeNode* node = local.head;
-            local.head = node->next;
-            --local.count;
-
-            node->next = central.head;
-            central.head = node;
-
-            ++count;
-        }
-    }
-
-    void allocateNewPage(std::size_t index)
-    {
-        const std::size_t blockSize = indexToSize(index);
-        const std::size_t blocksPerPage = PAGE_SIZE / blockSize;
-
-        void* page = systemAlloc(PAGE_SIZE);
-        if (page == nullptr) {
-            throw std::bad_alloc();
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(pageMutex_);
-
-            PageBlock* block = static_cast<PageBlock*>(std::malloc(sizeof(PageBlock)));
-            if (!block) {
-                systemFree(page, PAGE_SIZE);
-                throw std::bad_alloc();
-            }
-
-            block->memory = page;
-            block->size = PAGE_SIZE;
-            block->next = pageBlocks_;
-            pageBlocks_ = block;
-        }
-
-        auto& central = centralLists_[index];
-
-        std::lock_guard<std::mutex> lock(central.mtx);
-
-        char* start = static_cast<char*>(page);
-
-        for (std::size_t i = 0; i < blocksPerPage; ++i) {
-            FreeNode* node = reinterpret_cast<FreeNode*>(start + i * blockSize);
-            node->next = central.head;
-            central.head = node;
-        }
+        return reinterpret_cast<void*>(
+            reinterpret_cast<char*>(header) + sizeof(BlockHeader)
+        );
     }
 
 private:
-    static void* systemAlloc(std::size_t size)
+    Bucket* getOrCreateBucket(std::size_t blockSize)
     {
-#ifdef _WIN32
-        return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-        void* ptr = mmap(
+        {
+            std::lock_guard<std::mutex> lock(bucketMapMutex_);
+
+            auto it = buckets_.find(blockSize);
+            if (it != buckets_.end()) {
+                return it->second;
+            }
+
+            Bucket* bucket = new Bucket();
+            buckets_[blockSize] = bucket;
+            return bucket;
+        }
+    }
+
+    std::size_t choosePageSize(std::size_t blockSize)
+    {
+        const std::size_t unitSize = sizeof(BlockHeader) + blockSize;
+
+        const std::size_t systemPageSize = static_cast<std::size_t>(::getpagesize());
+
+        std::size_t targetBlockCount = 0;
+
+        if (blockSize <= 64) {
+            targetBlockCount = 1024;
+        } else if (blockSize <= 256) {
+            targetBlockCount = 512;
+        } else if (blockSize <= 1024) {
+            targetBlockCount = 256;
+        } else if (blockSize <= 4096) {
+            targetBlockCount = 128;
+        } else if (blockSize <= 64 * 1024) {
+            targetBlockCount = 32;
+        } else if (blockSize <= 1024 * 1024) {
+            targetBlockCount = 4;
+        } else {
+            targetBlockCount = 1;
+        }
+
+        std::size_t rawPageSize = unitSize * targetBlockCount;
+
+        if (rawPageSize < systemPageSize) {
+            rawPageSize = systemPageSize;
+        }
+
+        return alignUpToPage(rawPageSize);
+    }
+
+    void allocateNewPage(std::size_t blockSize)
+    {
+        Bucket* bucket = getOrCreateBucket(blockSize);
+
+        const std::size_t unitSize = sizeof(BlockHeader) + blockSize;
+        const std::size_t pageSize = choosePageSize(blockSize);
+        const std::size_t blockCount = pageSize / unitSize;
+
+        void* page = ::mmap(
             nullptr,
-            size,
+            pageSize,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1,
             0
         );
 
-        if (ptr == MAP_FAILED) {
-            return nullptr;
+        if (page == MAP_FAILED) {
+            throw std::bad_alloc();
         }
 
-        return ptr;
-#endif
+        {
+            std::lock_guard<std::mutex> pageLock(pageMutex_);
+
+            pages_.push_back(PageInfo{
+                page,
+                pageSize,
+                blockSize,
+                blockCount
+            });
+        }
+
+        char* current = static_cast<char*>(page);
+
+        {
+            std::lock_guard<std::mutex> bucketLock(bucket->mutex);
+
+            for (std::size_t i = 0; i < blockCount; ++i) {
+                BlockHeader* header = reinterpret_cast<BlockHeader*>(current);
+
+                header->magic = BLOCK_MAGIC;
+                header->requestedSize = blockSize;
+                header->blockSize = blockSize;
+
+                void* userPtr = getUserPointerFromHeader(header);
+
+                FreeNode* node = static_cast<FreeNode*>(userPtr);
+                node->next = bucket->freeList;
+                bucket->freeList = node;
+
+                bucket->freeCount++;
+                bucket->totalCount++;
+
+                current += unitSize;
+            }
+        }
     }
 
-    static void systemFree(void* ptr, std::size_t size)
-    {
-#ifdef _WIN32
-        (void)size;
-        VirtualFree(ptr, 0, MEM_RELEASE);
-#else
-        munmap(ptr, size);
-#endif
-    }
-
+private:
     void releaseAllPages()
     {
-        PageBlock* block = pageBlocks_;
+        std::lock_guard<std::mutex> lock(pageMutex_);
 
-        while (block != nullptr) {
-            PageBlock* next = block->next;
-
-            systemFree(block->memory, block->size);
-            std::free(block);
-
-            block = next;
+        for (const auto& page : pages_) {
+            ::munmap(page.pageAddress, page.pageSize);
         }
 
-        pageBlocks_ = nullptr;
+        pages_.clear();
+    }
+
+    void releaseAllBuckets()
+    {
+        std::lock_guard<std::mutex> lock(bucketMapMutex_);
+
+        for (auto& kv : buckets_) {
+            delete kv.second;
+        }
+
+        buckets_.clear();
     }
 };
 
 // ============================================================
-// STL allocator 适配器
-// 可用于 std::vector / std::list / std::map 等容器
+// 测试对象
 // ============================================================
 
-template <typename T>
-class PoolAllocator
+struct ImageFrame
 {
-public:
-    using value_type = T;
+    int frameId;
+    int width;
+    int height;
+    char name[64];
 
-public:
-    PoolAllocator() noexcept = default;
-
-    template <typename U>
-    PoolAllocator(const PoolAllocator<U>&) noexcept {}
-
-    T* allocate(std::size_t n)
+    ImageFrame(int id, int w, int h)
+        : frameId(id), width(w), height(h)
     {
-        return static_cast<T*>(
-            MemoryPool::instance().allocate(n * sizeof(T))
-        );
-    }
-
-    void deallocate(T* ptr, std::size_t n) noexcept
-    {
-        MemoryPool::instance().deallocate(ptr, n * sizeof(T));
-    }
-
-    template <typename U>
-    bool operator==(const PoolAllocator<U>&) const noexcept
-    {
-        return true;
-    }
-
-    template <typename U>
-    bool operator!=(const PoolAllocator<U>&) const noexcept
-    {
-        return false;
-    }
-};
-
-// ============================================================
-// 测试结构体
-// ============================================================
-
-struct TestObject
-{
-    int id;
-    double value;
-    char name[32];
-
-    TestObject(int i, double v)
-        : id(i), value(v)
-    {
-        std::snprintf(name, sizeof(name), "Object-%d", i);
+        std::snprintf(name, sizeof(name), "Frame-%d", id);
     }
 
     void print() const
     {
-        std::cout << "id=" << id
-                  << ", value=" << value
+        std::cout << "ImageFrame: "
+                  << "id=" << frameId
+                  << ", width=" << width
+                  << ", height=" << height
                   << ", name=" << name
                   << std::endl;
     }
 };
-
-// ============================================================
-// 单线程性能测试
-// ============================================================
-
-void benchmarkSingleThread()
-{
-    constexpr std::size_t N = 1'000'000;
-
-    std::vector<void*> ptrs;
-    ptrs.reserve(N);
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    for (std::size_t i = 0; i < N; ++i) {
-        void* p = MemoryPool::instance().allocate(64);
-        ptrs.push_back(p);
-    }
-
-    for (void* p : ptrs) {
-        MemoryPool::instance().deallocate(p, 64);
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-
-    auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-
-    std::cout << "[MemoryPool SingleThread] "
-              << N << " alloc/free cost: "
-              << cost << " ms"
-              << std::endl;
-}
-
-void benchmarkMallocSingleThread()
-{
-    constexpr std::size_t N = 1'000'000;
-
-    std::vector<void*> ptrs;
-    ptrs.reserve(N);
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    for (std::size_t i = 0; i < N; ++i) {
-        void* p = ::operator new(64);
-        ptrs.push_back(p);
-    }
-
-    for (void* p : ptrs) {
-        ::operator delete(p);
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-
-    auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-
-    std::cout << "[System new/delete SingleThread] "
-              << N << " alloc/free cost: "
-              << cost << " ms"
-              << std::endl;
-}
-
-// ============================================================
-// 多线程性能测试
-// ============================================================
-
-void benchmarkMultiThread()
-{
-    constexpr std::size_t THREAD_COUNT = 8;
-    constexpr std::size_t ALLOC_PER_THREAD = 300'000;
-
-    std::atomic<std::size_t> finished{0};
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    std::vector<std::thread> threads;
-
-    for (std::size_t t = 0; t < THREAD_COUNT; ++t) {
-        threads.emplace_back([&]() {
-            std::vector<void*> ptrs;
-            ptrs.reserve(ALLOC_PER_THREAD);
-
-            for (std::size_t i = 0; i < ALLOC_PER_THREAD; ++i) {
-                void* p = MemoryPool::instance().allocate(64);
-                ptrs.push_back(p);
-            }
-
-            for (void* p : ptrs) {
-                MemoryPool::instance().deallocate(p, 64);
-            }
-
-            ++finished;
-        });
-    }
-
-    for (auto& th : threads) {
-        th.join();
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-
-    auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-
-    std::cout << "[MemoryPool MultiThread] "
-              << THREAD_COUNT * ALLOC_PER_THREAD
-              << " alloc/free cost: "
-              << cost << " ms"
-              << std::endl;
-}
 
 // ============================================================
 // 功能测试
@@ -535,29 +424,193 @@ void functionalTest()
 {
     std::cout << "========== Functional Test ==========" << std::endl;
 
-    auto& pool = MemoryPool::instance();
+    auto& pool = LinuxMemoryPool::instance();
 
-    TestObject* obj = pool.create<TestObject>(1, 3.14159);
-    obj->print();
-    pool.destroy(obj);
+    void* p1 = pool.allocate(128);
+    void* p2 = pool.allocate(128);
+    void* p3 = pool.allocate(1024);
 
-    int* number = pool.create<int>(12345);
-    std::cout << "number = " << *number << std::endl;
-    pool.destroy(number);
+    std::memset(p1, 0x11, 128);
+    std::memset(p2, 0x22, 128);
+    std::memset(p3, 0x33, 1024);
 
-    std::vector<int, PoolAllocator<int>> vec;
+    std::cout << "p1 = " << p1 << std::endl;
+    std::cout << "p2 = " << p2 << std::endl;
+    std::cout << "p3 = " << p3 << std::endl;
 
-    for (int i = 0; i < 10; ++i) {
-        vec.push_back(i * 10);
+    pool.deallocate(p1);
+    pool.deallocate(p2);
+    pool.deallocate(p3);
+
+    void* p4 = pool.allocate(128);
+    std::cout << "p4 = " << p4 << "  reuse 128-byte block" << std::endl;
+    pool.deallocate(p4);
+
+    ImageFrame* frame = pool.create<ImageFrame>(1, 640, 480);
+    frame->print();
+    pool.destroy(frame);
+
+    pool.printStats();
+}
+
+// ============================================================
+// 模拟超声图像 buffer 申请
+// ============================================================
+
+void ultrasoundBufferTest()
+{
+    std::cout << "========== Ultrasound Buffer Test ==========" << std::endl;
+
+    auto& pool = LinuxMemoryPool::instance();
+
+    constexpr std::size_t FRAME_COUNT = 16;
+    constexpr std::size_t RF_BUFFER_SIZE = 1024 * 1024;
+    constexpr std::size_t IMAGE_BUFFER_SIZE = 640 * 480;
+
+    std::vector<void*> rfBuffers;
+    std::vector<void*> imageBuffers;
+
+    for (std::size_t i = 0; i < FRAME_COUNT; ++i) {
+        void* rf = pool.allocate(RF_BUFFER_SIZE);
+        void* img = pool.allocate(IMAGE_BUFFER_SIZE);
+
+        rfBuffers.push_back(rf);
+        imageBuffers.push_back(img);
     }
 
-    std::cout << "vector with PoolAllocator: ";
-
-    for (int v : vec) {
-        std::cout << v << " ";
+    for (void* p : rfBuffers) {
+        pool.deallocate(p);
     }
 
-    std::cout << std::endl;
+    for (void* p : imageBuffers) {
+        pool.deallocate(p);
+    }
+
+    pool.printStats();
+}
+
+// ============================================================
+// 性能测试：内存池 vs malloc/free
+// ============================================================
+
+void benchmarkMemoryPool()
+{
+    std::cout << "========== Benchmark MemoryPool ==========" << std::endl;
+
+    constexpr std::size_t N = 1'000'000;
+    constexpr std::size_t SIZE = 256;
+
+    auto& pool = LinuxMemoryPool::instance();
+
+    std::vector<void*> ptrs;
+    ptrs.reserve(N);
+
+    auto begin = std::chrono::high_resolution_clock::now();
+
+    for (std::size_t i = 0; i < N; ++i) {
+        ptrs.push_back(pool.allocate(SIZE));
+    }
+
+    for (void* p : ptrs) {
+        pool.deallocate(p);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+
+    std::cout << "MemoryPool allocate/deallocate "
+              << N << " blocks, size = "
+              << SIZE << ", cost = "
+              << cost << " ms"
+              << std::endl;
+}
+
+void benchmarkMalloc()
+{
+    std::cout << "========== Benchmark malloc/free ==========" << std::endl;
+
+    constexpr std::size_t N = 1'000'000;
+    constexpr std::size_t SIZE = 256;
+
+    std::vector<void*> ptrs;
+    ptrs.reserve(N);
+
+    auto begin = std::chrono::high_resolution_clock::now();
+
+    for (std::size_t i = 0; i < N; ++i) {
+        ptrs.push_back(std::malloc(SIZE));
+    }
+
+    for (void* p : ptrs) {
+        std::free(p);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+
+    std::cout << "malloc/free allocate/deallocate "
+              << N << " blocks, size = "
+              << SIZE << ", cost = "
+              << cost << " ms"
+              << std::endl;
+}
+
+// ============================================================
+// 多线程测试
+// ============================================================
+
+void multiThreadTest()
+{
+    std::cout << "========== Multi Thread Test ==========" << std::endl;
+
+    constexpr std::size_t THREAD_COUNT = 8;
+    constexpr std::size_t LOOP_COUNT = 200000;
+    constexpr std::size_t SIZE = 512;
+
+    auto& pool = LinuxMemoryPool::instance();
+
+    auto begin = std::chrono::high_resolution_clock::now();
+
+    std::vector<std::thread> threads;
+    std::atomic<std::size_t> doneCount{0};
+
+    for (std::size_t t = 0; t < THREAD_COUNT; ++t) {
+        threads.emplace_back([&pool, &doneCount]() {
+            std::vector<void*> ptrs;
+            ptrs.reserve(LOOP_COUNT);
+
+            for (std::size_t i = 0; i < LOOP_COUNT; ++i) {
+                void* p = pool.allocate(SIZE);
+                ptrs.push_back(p);
+            }
+
+            for (void* p : ptrs) {
+                pool.deallocate(p);
+            }
+
+            doneCount++;
+        });
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+
+    auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+
+    std::cout << "MultiThread MemoryPool "
+              << THREAD_COUNT * LOOP_COUNT
+              << " blocks, size = "
+              << SIZE
+              << ", cost = "
+              << cost << " ms"
+              << std::endl;
+
+    pool.printStats();
 }
 
 // ============================================================
@@ -568,13 +621,15 @@ int main()
 {
     functionalTest();
 
-    std::cout << "\n========== Benchmark ==========" << std::endl;
+    ultrasoundBufferTest();
 
-    benchmarkSingleThread();
-    benchmarkMallocSingleThread();
-    benchmarkMultiThread();
+    benchmarkMemoryPool();
 
-    std::cout << "\nDone." << std::endl;
+    benchmarkMalloc();
+
+    multiThreadTest();
+
+    std::cout << "Done." << std::endl;
 
     return 0;
 }
