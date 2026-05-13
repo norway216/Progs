@@ -15,162 +15,312 @@
 #include <vector>
 #include <chrono>
 
-class AtomicThreadPool {
-public:
-    explicit AtomicThreadPool(std::size_t thread_count = std::thread::hardware_concurrency())
-        : stop_flag_(false),
-          active_tasks_(0),
-          idle_threads_(0) {
-        if (thread_count == 0) {
-            thread_count = 1;
-        }
+#pragma once
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <cstring>
+#include <cstdlib>
+#include <cassert>
+#include <sys/mman.h>
+#include <unistd.h>
 
-        workers_.reserve(thread_count);
+class LinuxMemoryPool
+{
+private:
+    static constexpr std::size_t ALIGNMENT = 16;
+    static constexpr std::uint64_t BLOCK_MAGIC = 0x20260508CAFEBABEULL;
+    static constexpr std::uint64_t BLOCK_FREED = 0xDEADBEEFCAFEBABEULL;
 
-        for (std::size_t i = 0; i < thread_count; ++i) {
-            workers_.emplace_back([this]() {
-                this->worker_loop();
-            });
-        }
+    struct BlockHeader
+    {
+        std::uint64_t magic;
+        std::size_t requestedSize;
+        std::size_t blockSize;
+    };
+
+    struct FreeNode
+    {
+        FreeNode* next;
+    };
+
+    struct PageInfo
+    {
+        void* pageAddress;
+        std::size_t pageSize;
+        std::size_t blockSize;
+        std::size_t blockCount;
+    };
+
+    struct Bucket
+    {
+        FreeNode* freeList = nullptr;
+        std::size_t freeCount = 0;
+        std::size_t totalCount = 0;
+        std::mutex mutex;
+    };
+
+private:
+    std::unordered_map<std::size_t, Bucket*> buckets_;
+    std::vector<PageInfo> pages_;
+    std::mutex bucketMapMutex_;
+    std::mutex pageMutex_;
+
+    LinuxMemoryPool() = default;
+
+    ~LinuxMemoryPool()
+    {
+        releaseAllPages();
+        releaseAllBuckets();
     }
 
-    AtomicThreadPool(const AtomicThreadPool&) = delete;
-    AtomicThreadPool& operator=(const AtomicThreadPool&) = delete;
+    LinuxMemoryPool(const LinuxMemoryPool&) = delete;
+    LinuxMemoryPool& operator=(const LinuxMemoryPool&) = delete;
 
-    AtomicThreadPool(AtomicThreadPool&&) = delete;
-    AtomicThreadPool& operator=(AtomicThreadPool&&) = delete;
-
-    ~AtomicThreadPool() {
-        shutdown();
+public:
+    static LinuxMemoryPool& instance()
+    {
+        static LinuxMemoryPool pool;
+        return pool;
     }
 
 public:
-    template <typename F, typename... Args>
-    auto submit(F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>> {
-        using ReturnType = std::invoke_result_t<F, Args...>;
+    void* allocate(std::size_t size)
+    {
+        if (size == 0) size = 1;
 
-        if (stop_flag_.load(std::memory_order_acquire)) {
-            throw std::runtime_error("ThreadPool is stopped; cannot submit new tasks.");
+        std::size_t blockSize = alignUp(size);
+        Bucket* bucket = getOrCreateBucket(blockSize);
+
+        // 优先从 free list 获取
+        {
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            if (bucket->freeList)
+            {
+                FreeNode* node = bucket->freeList;
+                bucket->freeList = node->next;
+                bucket->freeCount--;
+
+                BlockHeader* header = getHeaderFromUserPointer(node);
+                assert(header->magic == BLOCK_MAGIC || header->magic == BLOCK_FREED);
+                header->magic = BLOCK_MAGIC;
+                header->requestedSize = size;
+
+                return static_cast<void*>(node);
+            }
         }
 
-        auto task_ptr = std::make_shared<std::packaged_task<ReturnType()>>(
-            [func = std::forward<F>(f),
-             tup = std::make_tuple(std::forward<Args>(args)...)]() mutable -> ReturnType {
-                return std::apply(std::move(func), std::move(tup));
-            });
+        // 分配新页
+        allocateNewPage(blockSize);
 
-        std::future<ReturnType> result = task_ptr->get_future();
+        // 再次尝试
+        {
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            if (bucket->freeList)
+            {
+                FreeNode* node = bucket->freeList;
+                bucket->freeList = node->next;
+                bucket->freeCount--;
+
+                BlockHeader* header = getHeaderFromUserPointer(node);
+                header->magic = BLOCK_MAGIC;
+                header->requestedSize = size;
+
+                return static_cast<void*>(node);
+            }
+        }
+
+        throw std::bad_alloc();
+    }
+
+    void deallocate(void* ptr)
+    {
+        if (!ptr) return;
+
+        BlockHeader* header = getHeaderFromUserPointer(ptr);
+
+        if (header->magic != BLOCK_MAGIC)
+        {
+            std::cerr << "[MemoryPool Error] Invalid pointer or double free detected." << std::endl;
+            std::abort();
+        }
+
+        header->magic = BLOCK_FREED;
+
+        Bucket* bucket = getOrCreateBucket(header->blockSize);
+        FreeNode* node = static_cast<FreeNode*>(ptr);
 
         {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-
-            if (stop_flag_.load(std::memory_order_relaxed)) {
-                throw std::runtime_error("ThreadPool is stopped during submit.");
-            }
-
-            tasks_.emplace([task_ptr]() {
-                (*task_ptr)();
-            });
-        }
-
-        active_tasks_.fetch_add(1, std::memory_order_relaxed);
-        cv_.notify_one();
-
-        return result;
-    }
-
-    void shutdown() {
-        bool expected = false;
-        if (!stop_flag_.compare_exchange_strong(
-                expected, true,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            return;
-        }
-
-        cv_.notify_all();
-
-        for (std::thread& t : workers_) {
-            if (t.joinable()) {
-                t.join();
-            }
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            node->next = bucket->freeList;
+            bucket->freeList = node;
+            bucket->freeCount++;
         }
     }
 
-    void wait_for_all() {
-        std::unique_lock<std::mutex> lock(wait_mutex_);
-        wait_cv_.wait(lock, [this]() {
-            return active_tasks_.load(std::memory_order_acquire) == 0;
-        });
+    template <typename T, typename... Args>
+    T* create(Args&&... args)
+    {
+        void* mem = allocate(sizeof(T));
+        try {
+            return new (mem) T(std::forward<Args>(args)...);
+        } catch (...) {
+            deallocate(mem);
+            throw;
+        }
     }
 
-    [[nodiscard]] std::size_t thread_count() const noexcept {
-        return workers_.size();
+    template <typename T>
+    void destroy(T* obj)
+    {
+        if (!obj) return;
+        obj->~T();
+        deallocate(obj);
     }
 
-    [[nodiscard]] std::size_t active_task_count() const noexcept {
-        return active_tasks_.load(std::memory_order_acquire);
-    }
+    void printStats()
+    {
+        std::lock_guard<std::mutex> mapLock(bucketMapMutex_);
+        std::lock_guard<std::mutex> pageLock(pageMutex_);
 
-    [[nodiscard]] std::size_t idle_thread_count() const noexcept {
-        return idle_threads_.load(std::memory_order_acquire);
+        std::cout << "\n========== Memory Pool Stats ==========" << std::endl;
+
+        std::size_t totalPageBytes = 0;
+        for (const auto& page : pages_) totalPageBytes += page.pageSize;
+
+        std::cout << "Page count      : " << pages_.size() << std::endl;
+        std::cout << "Total page bytes: " << totalPageBytes << std::endl;
+        std::cout << "Bucket count    : " << buckets_.size() << std::endl;
+
+        for (const auto& kv : buckets_)
+        {
+            Bucket* bucket = kv.second;
+            std::lock_guard<std::mutex> bucketLock(bucket->mutex);
+            std::cout << "BlockSize = " << kv.first
+                      << " bytes, total = " << bucket->totalCount
+                      << ", free = " << bucket->freeCount
+                      << ", used = " << bucket->totalCount - bucket->freeCount
+                      << std::endl;
+        }
+
+        std::cout << "=======================================\n" << std::endl;
     }
 
 private:
-    void worker_loop() {
-        while (true) {
-            std::function<void()> task;
+    static std::size_t alignUp(std::size_t size)
+    {
+        return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    }
 
+    static std::size_t alignUpToPage(std::size_t size)
+    {
+        const std::size_t pageSize = static_cast<std::size_t>(::getpagesize());
+        return (size + pageSize - 1) & ~(pageSize - 1);
+    }
+
+    static BlockHeader* getHeaderFromUserPointer(void* userPtr)
+    {
+        return reinterpret_cast<BlockHeader*>(static_cast<char*>(userPtr) - sizeof(BlockHeader));
+    }
+
+    static void* getUserPointerFromHeader(BlockHeader* header)
+    {
+        return reinterpret_cast<void*>(reinterpret_cast<char*>(header) + sizeof(BlockHeader));
+    }
+
+private:
+    Bucket* getOrCreateBucket(std::size_t blockSize)
+    {
+        // 双重检查锁，避免重复创建 bucket
+        {
+            std::lock_guard<std::mutex> lock(bucketMapMutex_);
+            auto it = buckets_.find(blockSize);
+            if (it != buckets_.end()) return it->second;
+        }
+
+        Bucket* bucket = new Bucket();
+        {
+            std::lock_guard<std::mutex> lock(bucketMapMutex_);
+            auto [it, inserted] = buckets_.emplace(blockSize, bucket);
+            if (!inserted) { delete bucket; return it->second; }
+        }
+        return bucket;
+    }
+
+    std::size_t choosePageSize(std::size_t blockSize)
+    {
+        const std::size_t unitSize = sizeof(BlockHeader) + blockSize;
+        const std::size_t pageSize = static_cast<std::size_t>(::getpagesize());
+        std::size_t targetBlockCount = 0;
+
+        if (blockSize <= 64) targetBlockCount = 1024;
+        else if (blockSize <= 256) targetBlockCount = 512;
+        else if (blockSize <= 1024) targetBlockCount = 256;
+        else if (blockSize <= 4096) targetBlockCount = 128;
+        else if (blockSize <= 64*1024) targetBlockCount = 32;
+        else if (blockSize <= 1024*1024) targetBlockCount = 4;
+        else targetBlockCount = 1;
+
+        std::size_t rawSize = unitSize * targetBlockCount;
+        if (rawSize < pageSize) rawSize = pageSize;
+        return alignUpToPage(rawSize);
+    }
+
+    void allocateNewPage(std::size_t blockSize)
+    {
+        Bucket* bucket = getOrCreateBucket(blockSize);
+
+        const std::size_t unitSize = sizeof(BlockHeader) + blockSize;
+        const std::size_t pageSize = choosePageSize(blockSize);
+        const std::size_t blockCount = pageSize / unitSize;
+
+        void* page = ::mmap(nullptr, pageSize, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) throw std::bad_alloc();
+
+        {
+            std::lock_guard<std::mutex> lock(pageMutex_);
+            pages_.push_back({page, pageSize, blockSize, blockCount});
+        }
+
+        char* current = static_cast<char*>(page);
+        {
+            std::lock_guard<std::mutex> lock(bucket->mutex);
+            for (std::size_t i = 0; i < blockCount; ++i)
             {
-                std::unique_lock<std::mutex> lock(queue_mutex_);
+                BlockHeader* header = reinterpret_cast<BlockHeader*>(current);
+                header->magic = BLOCK_MAGIC;
+                header->requestedSize = 0; // 用户请求大小初始化为 0
+                header->blockSize = blockSize;
 
-                idle_threads_.fetch_add(1, std::memory_order_relaxed);
+                FreeNode* node = static_cast<FreeNode*>(getUserPointerFromHeader(header));
+                node->next = bucket->freeList;
+                bucket->freeList = node;
+                bucket->freeCount++;
+                bucket->totalCount++;
 
-                cv_.wait(lock, [this]() {
-                    return stop_flag_.load(std::memory_order_acquire) || !tasks_.empty();
-                });
-
-                idle_threads_.fetch_sub(1, std::memory_order_relaxed);
-
-                if (stop_flag_.load(std::memory_order_acquire) && tasks_.empty()) {
-                    return;
-                }
-
-                task = std::move(tasks_.front());
-                tasks_.pop();
-            }
-
-            try {
-                task();
-            } catch (...) {
-                // 理论上 packaged_task 会自己捕获异常并传入 future，
-                // 这里主要兜底，防止线程因异常退出。
-            }
-
-            const std::size_t remaining =
-                active_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-
-            if (remaining == 0) {
-                std::lock_guard<std::mutex> lock(wait_mutex_);
-                wait_cv_.notify_all();
+                current += unitSize;
             }
         }
     }
 
-private:
-    std::vector<std::thread> workers_;
+    void releaseAllPages()
+    {
+        std::lock_guard<std::mutex> lock(pageMutex_);
+        for (auto& page : pages_)
+            ::munmap(page.pageAddress, page.pageSize);
+        pages_.clear();
+    }
 
-    std::queue<std::function<void()>> tasks_;
-    mutable std::mutex queue_mutex_;
-    std::condition_variable cv_;
-
-    std::atomic<bool> stop_flag_;
-    std::atomic<std::size_t> active_tasks_;
-    std::atomic<std::size_t> idle_threads_;
-
-    std::mutex wait_mutex_;
-    std::condition_variable wait_cv_;
+    void releaseAllBuckets()
+    {
+        std::lock_guard<std::mutex> lock(bucketMapMutex_);
+        for (auto& kv : buckets_) delete kv.second;
+        buckets_.clear();
+    }
 };
 
 static int heavy_compute(int x) {
